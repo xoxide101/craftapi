@@ -1,0 +1,18 @@
+{
+  "name": "craftapi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Command layer for the Craft apps so humans and agents drive the same engine",
+  "scripts": {
+    "smoke": "node server/smoke.mjs",
+    "smoke:mcp": "node server/mcp-smoke.mjs",
+    "test": "node server/smoke.mjs && node server/mcp-smoke.mjs",
+    "mcp": "node server/mcp.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "playwright-core": "^1.48.0",
+    "zod": "^4.6.7"
+  }
+}
