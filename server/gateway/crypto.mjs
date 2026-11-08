@@ -4,8 +4,7 @@ import { promisify } from 'node:util';
 const scryptAsync = promisify(scrypt);
 const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 64 };
 
-export async function hashPassword(password) {
-  const salt = randomBytes(16);
+export async function hashPassword(password, salt = randomBytes(16)) { // salt param is for test vectors only
   const dk = await scryptAsync(password, salt, SCRYPT.keylen, { N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p });
   return `scrypt$${SCRYPT.N}$${SCRYPT.r}$${SCRYPT.p}$${salt.toString('base64')}$${dk.toString('base64')}`;
 }
@@ -32,8 +31,7 @@ export function deriveKeys(master) {
 }
 
 // AES-256-GCM; aad binds a record to its owner so blobs can't be swapped between users.
-export function encrypt(key, plaintext, aad) {
-  const iv = randomBytes(12);
+export function encrypt(key, plaintext, aad, iv = randomBytes(12)) { // iv param is for test vectors only
   const c = createCipheriv('aes-256-gcm', key, iv);
   c.setAAD(Buffer.from(aad));
   const ct = Buffer.concat([c.update(plaintext, 'utf8'), c.final()]);
@@ -54,8 +52,7 @@ export function maskSecret(s) {
 
 const b64u = (b) => Buffer.from(b).toString('base64url');
 
-export function signJwt(secret, claims, ttlSec) {
-  const now = Math.floor(Date.now() / 1000);
+export function signJwt(secret, claims, ttlSec, now = Math.floor(Date.now() / 1000)) {
   const head = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
   const body = b64u(JSON.stringify({ ...claims, iat: now, exp: now + ttlSec }));
   const sig = createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');

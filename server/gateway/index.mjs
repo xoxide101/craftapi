@@ -8,6 +8,9 @@ const { server } = createGateway({
   masterKey: process.env.CRAFT_MASTER_KEY,
   mode,
   allowSignup: process.env.CRAFT_ALLOW_SIGNUP === '1',
+  gatewayId: process.env.CRAFT_GATEWAY_ID || undefined,
+  name: process.env.CRAFT_GATEWAY_NAME || undefined,
+  corsOrigins: process.env.CRAFT_CORS_ORIGINS || '',
   upstreamAllow: process.env.CRAFT_UPSTREAM_ALLOW || '',
   store: new Store(process.env.CRAFT_GATEWAY_DATA || 'data/gateway.json'),
 });
