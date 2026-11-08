@@ -12,6 +12,7 @@ Started Wed 2026-10-21 for review with Claude on Friday. First target: **3dcraft
 | `browser/craftapi.js` | In-page layer (`window.craftAPI`) wrapping the engine (`window.E3`) | working (v0.2) |
 | `server/session.mjs` | Launches headless Chrome, opens 3dcraft from disk, injects the API | working |
 | `server/mcp.mjs` | MCP server (stdio): 15 tools over the API | working |
+| `server/gateway/` | craft-api gateway: login, encrypted key vault, upstream proxy (SPEC section 8) | working, `npm run test:gateway` |
 | `explorer/explore.mjs` | Branch explorer (beam search over snapshots) | working |
 | `server/smoke.mjs`, `server/mcp-smoke.mjs` | End-to-end tests (50+ checks against the real 3dcraft) | passing |
 

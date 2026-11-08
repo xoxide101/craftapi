@@ -91,3 +91,30 @@ Per agent: what it has read/seen, in what order, links it made, its past judgmen
 - Which scores matter first for 3dcraft: print check only, or also a reference-image difference?
 - Do other Craft apps (logocraft, labelcraft, sitecraft) have an engine object like `E3`, or do they need one first?
 - Where does human rating get entered: the GUI, or the API only?
+
+## 8. craft-api gateway (identity broker + key vault + proxy)
+
+Code: `server/gateway/` (`npm run gateway`), tests: `test/gateway.test.mjs` (`npm run test:gateway`). Only `node:` built-ins, no new dependencies.
+
+**Env**: `CRAFT_MASTER_KEY` (required; 32 bytes base64 or hex; never committed, never stored), `CRAFT_GATEWAY_MODE` (`single` default | `multi`), `CRAFT_ALLOW_SIGNUP=1` (multi: open signup), `CRAFT_GATEWAY_PORT` (8787), `CRAFT_GATEWAY_HOST` (127.0.0.1), `CRAFT_GATEWAY_DATA` (`data/gateway.json`, git-ignored, mode 0600).
+
+**Modes**: `single` = the first registered account becomes admin, then registration and `/users` are closed. `multi` = first account is admin; later users are created by an admin (`POST /users`) or by open signup if enabled. Every key/token is private to its owner.
+
+**Security**: passwords hashed with scrypt (N=16384, per-user salt), never stored plain; login throttled (5 failures -> 60 s). Vault: AES-256-GCM, random 12-byte IV per record, AAD = `ownerId:keyId`; keys derived from the master key via HKDF (separate vault and JWT keys). Secrets are decrypted in memory only while proxying; the API returns only a mask (`AIz…1234`). Session tokens are HS256 JWTs (1 h). API tokens (`cg_...`) are shown once, stored as SHA-256, revocable, optionally expiring, and limited to a subset of the creator's scopes. Scopes: `keys:read`, `keys:write`, `proxy:use`, `tokens:manage`, `admin`.
+
+**Endpoints** (`/api/v1`, JSON, errors as in section 1):
+
+| Route | Auth/scope | Purpose |
+|---|---|---|
+| `GET /health`, `GET /providers` | none | status, provider list |
+| `POST /auth/register` `{userId,password}` | per mode | create account (password 10+ chars) |
+| `POST /auth/login` `{userId,password,scopes?}` | none | -> `{token,expiresIn,scopes}` |
+| `GET /auth/me` | any | user + scopes |
+| `GET/POST /users` | admin | list / create users (multi mode) |
+| `GET/POST /tokens`, `DELETE /tokens/:id` | tokens:manage | scoped API tokens |
+| `GET/POST /keys`, `DELETE /keys/:id` | keys:read / keys:write | vault; POST `{provider,label,secret,baseUrl?}` |
+| `ANY /proxy/:provider/*` | proxy:use | forwards upstream with the stored key attached |
+
+**Proxy**: providers are `ollama`, `gemini`, `openai`, `anthropic`, `custom`. The key is chosen by provider (first one, or label in header `X-Craft-Key`). Client `Authorization`/`x-api-key`/`x-goog-api-key`/cookie headers are dropped and the right upstream header is added server-side. `baseUrl` is only accepted for `ollama`/`custom`; path traversal is rejected; redirects are not followed; responses stream through.
+
+Not done: key rotation of the master key, per-key quotas/usage logs, TLS (run behind a reverse proxy; bind to localhost by default).
