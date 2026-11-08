@@ -1,7 +1,9 @@
-import { createServer } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
+import { request as httpsRequest } from 'node:https';
 import { Store } from './store.mjs';
 import { PROVIDERS } from './providers.mjs';
 import * as C from './crypto.mjs';
+import { vetUpstream, parseAllowList } from './ssrf.mjs';
 
 const USER_SCOPES = ['keys:read', 'keys:write', 'proxy:use', 'tokens:manage'];
 const ALL_SCOPES = [...USER_SCOPES, 'admin'];
@@ -11,12 +13,20 @@ const STRIP = new Set(['host', 'connection', 'content-length', 'authorization', 
 class HttpError extends Error {
   constructor(status, code, message) { super(message); this.status = status; this.code = code; }
 }
+const isIPLiteral = (h) => /^[\d.]+$|:/.test(h);
 const err = (s, c, m) => new HttpError(s, c, m);
 
-export function createGateway({ masterKey, mode = 'single', allowSignup = false, store = new Store(), fetchImpl = fetch } = {}) {
+export function createGateway({ masterKey, mode = 'single', allowSignup = false, store = new Store(), upstreamAllow = '', allowLoopback = mode === 'single' } = {}) {
   if (!['single', 'multi'].includes(mode)) throw new Error('mode must be single or multi');
   const keys = C.deriveKeys(C.parseMasterKey(masterKey));
   const db = store.data;
+  const allowList = parseAllowList(upstreamAllow);
+  let gateway; // set below; gives the vetting code our own listen address
+  const vet = (u) => {
+    const a = gateway.address();
+    const self = a && typeof a === 'object' ? { port: a.port, host: a.address } : null;
+    return vetUpstream(u, { allowList, allowLoopback, self });
+  };
   const failures = new Map(); // login throttle: key -> { n, until }
 
   const publicUser = (u) => ({ id: u.id, userId: u.userId, role: u.role, createdAt: u.createdAt });
@@ -105,6 +115,8 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
     target.pathname = `${basePath}/${rest}`.replace(/\/+/g, '/');
     if (!target.pathname.startsWith(`${basePath}/`) || /(^|\/)\.\.(\/|$)/.test(decodeURIComponent(rest))) throw err(400, 'bad_path', 'invalid path');
     target.search = search;
+    let vetted;
+    try { vetted = await vet(target.href); } catch (e) { throw err(403, 'upstream_blocked', e.message); }
 
     let secret = '';
     if (rec.secret) secret = C.decrypt(keys.vault, rec.secret, `${rec.owner}:${rec.id}`);
@@ -113,14 +125,22 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
     Object.assign(headers, p.auth(secret));
     const hasBody = !['GET', 'HEAD'].includes(req.method);
     const body = hasBody ? await readBody(req, 20 << 20) : undefined;
-    let up;
-    try {
-      up = await fetchImpl(target, { method: req.method, headers, body: hasBody && body.length ? body : undefined, redirect: 'manual' });
-    } catch { throw err(502, 'upstream_unreachable', 'upstream request failed'); }
+    headers.host = target.host;
+    if (body?.length) headers['content-length'] = body.length;
+    const doRequest = target.protocol === 'https:' ? httpsRequest : httpRequest;
+    const up = await new Promise((resolve, reject) => {
+      const ureq = doRequest(target, {
+        method: req.method, headers, servername: isIPLiteral(target.hostname) ? undefined : target.hostname,
+        // Pin the connection to the vetted IP so a second DNS answer (rebinding) cannot change the target.
+        lookup: (_h, _o, cb) => (_o?.all ? cb(null, [{ address: vetted.ip, family: vetted.family }]) : cb(null, vetted.ip, vetted.family)),
+      }, resolve);
+      ureq.on('error', reject);
+      ureq.end(body?.length ? body : undefined);
+    }).catch(() => { throw err(502, 'upstream_unreachable', 'upstream request failed'); });
     const out = {};
-    up.headers.forEach((v, k) => { if (!['content-encoding', 'content-length', 'transfer-encoding', 'connection', 'set-cookie'].includes(k)) out[k] = v; });
-    res.writeHead(up.status, out);
-    if (up.body) { for await (const chunk of up.body) res.write(chunk); }
+    for (const [k, v] of Object.entries(up.headers)) if (!['connection', 'transfer-encoding', 'set-cookie', 'keep-alive'].includes(k)) out[k] = v;
+    res.writeHead(up.statusCode, out);
+    for await (const chunk of up) res.write(chunk);
     res.end();
   }
 
@@ -218,7 +238,8 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
         if (!secret && !p.keyOptional) throw err(400, 'bad_request', 'secret required for this provider');
         if (baseUrl !== undefined) {
           if (!p.allowBaseUrl) throw err(400, 'bad_request', 'baseUrl not allowed for this provider');
-          try { if (!/^https?:$/.test(new URL(baseUrl).protocol)) throw 0; } catch { throw err(400, 'bad_request', 'baseUrl must be http(s) URL'); }
+          if (mode === 'multi' && ctx.user.role !== 'admin') throw err(403, 'forbidden', 'only admins may set a custom baseUrl in multi-user mode');
+          try { await vet(baseUrl); } catch (e) { throw err(400, 'bad_base_url', e.message); }
         }
         if (provider === 'custom' && !baseUrl) throw err(400, 'bad_request', 'custom provider needs baseUrl');
         if (Object.values(db.keys).some((k) => k.owner === ctx.user.id && k.provider === provider && k.label === label)) throw err(409, 'exists', 'label already used for this provider');
@@ -257,5 +278,6 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
       send(res, h.status, { ok: false, error: { code: h.code, message: h.message } });
     });
   });
+  gateway = server;
   return { server, store };
 }

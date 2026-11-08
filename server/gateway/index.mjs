@@ -8,6 +8,7 @@ const { server } = createGateway({
   masterKey: process.env.CRAFT_MASTER_KEY,
   mode,
   allowSignup: process.env.CRAFT_ALLOW_SIGNUP === '1',
+  upstreamAllow: process.env.CRAFT_UPSTREAM_ALLOW || '',
   store: new Store(process.env.CRAFT_GATEWAY_DATA || 'data/gateway.json'),
 });
 server.listen(port, host, () => console.log(`craft-api gateway (${mode}) on http://${host}:${port}/api/v1`));

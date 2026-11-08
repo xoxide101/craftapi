@@ -96,7 +96,7 @@ Per agent: what it has read/seen, in what order, links it made, its past judgmen
 
 Code: `server/gateway/` (`npm run gateway`), tests: `test/gateway.test.mjs` (`npm run test:gateway`). Only `node:` built-ins, no new dependencies.
 
-**Env**: `CRAFT_MASTER_KEY` (required; 32 bytes base64 or hex; never committed, never stored), `CRAFT_GATEWAY_MODE` (`single` default | `multi`), `CRAFT_ALLOW_SIGNUP=1` (multi: open signup), `CRAFT_GATEWAY_PORT` (8787), `CRAFT_GATEWAY_HOST` (127.0.0.1), `CRAFT_GATEWAY_DATA` (`data/gateway.json`, git-ignored, mode 0600).
+**Env**: `CRAFT_MASTER_KEY` (required; 32 bytes base64 or hex; never committed, never stored), `CRAFT_GATEWAY_MODE` (`single` default | `multi`), `CRAFT_ALLOW_SIGNUP=1` (multi: open signup), `CRAFT_GATEWAY_PORT` (8787), `CRAFT_GATEWAY_HOST` (127.0.0.1), `CRAFT_UPSTREAM_ALLOW` (operator allow-list for private upstreams, see SSRF defences), `CRAFT_GATEWAY_DATA` (`data/gateway.json`, git-ignored, mode 0600).
 
 **Modes**: `single` = the first registered account becomes admin, then registration and `/users` are closed. `multi` = first account is admin; later users are created by an admin (`POST /users`) or by open signup if enabled. Every key/token is private to its owner.
 
@@ -116,5 +116,7 @@ Code: `server/gateway/` (`npm run gateway`), tests: `test/gateway.test.mjs` (`np
 | `ANY /proxy/:provider/*` | proxy:use | forwards upstream with the stored key attached |
 
 **Proxy**: providers are `ollama`, `gemini`, `openai`, `anthropic`, `custom`. The key is chosen by provider (first one, or label in header `X-Craft-Key`). Client `Authorization`/`x-api-key`/`x-goog-api-key`/cookie headers are dropped and the right upstream header is added server-side. `baseUrl` is only accepted for `ollama`/`custom`; path traversal is rejected; redirects are not followed; responses stream through.
+
+**SSRF defences** (upstream URLs are vetted when a key is created and again on every proxy request): `baseUrl` may only be set by admins in multi mode (any user in single mode, who is the admin). The host is resolved and every address is checked; loopback, RFC1918, CGNAT, link-local (incl. 169.254.169.254 metadata), ULA, multicast and unspecified ranges (also IPv4-mapped IPv6) are refused with `400 bad_base_url` at create time and `403 upstream_blocked` at request time. Exceptions: `CRAFT_UPSTREAM_ALLOW` (comma list of `host`, `host:port`, `ip`, `ip:port`, IPv4 `a.b.c.d/len`, set by the operator) and, in single mode only, loopback (for local Ollama). The connection is pinned to the validated IP (custom `lookup`), so DNS rebinding cannot swap the target; only `http(s)` without embedded credentials is accepted. The gateway's own listen port on loopback/its bound address is always blocked, even if allow-listed.
 
 Not done: key rotation of the master key, per-key quotas/usage logs, TLS (run behind a reverse proxy; bind to localhost by default).
