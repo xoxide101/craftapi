@@ -1,0 +1,78 @@
+{
+  "passwordHash": {
+    "password": "correct horse battery",
+    "saltB64": "AQEBAQEBAQEBAQEBAQEBAQ==",
+    "expected": "scrypt$16384$8$1$AQEBAQEBAQEBAQEBAQEBAQ==$LJnihGkC/zn1Di7OCcuAZiPQ1jvMC0OzTGneG7U9FOn/mJEN2miQMQonv4hvwyJvyG6dI92a7jGzJDiI84W8qQ=="
+  },
+  "jwt": {
+    "keyHex": "0202020202020202020202020202020202020202020202020202020202020202",
+    "now": 1700000000,
+    "ttl": 3600,
+    "claims": {
+      "sub": "usr_test",
+      "gw": "gw_test",
+      "grants": [
+        {
+          "app": "ataricraft",
+          "scopes": [
+            "data:read"
+          ]
+        }
+      ],
+      "jti": "ses_test",
+      "iatMs": 1700000000000
+    },
+    "expected": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c3JfdGVzdCIsImd3IjoiZ3dfdGVzdCIsImdyYW50cyI6W3siYXBwIjoiYXRhcmljcmFmdCIsInNjb3BlcyI6WyJkYXRhOnJlYWQiXX1dLCJqdGkiOiJzZXNfdGVzdCIsImlhdE1zIjoxNzAwMDAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDAsImV4cCI6MTcwMDAwMzYwMH0.VhhkxUaQKVoqHAxAXD4doMa5OrQ69FCVWAOegdcVbdQ"
+  },
+  "apiTokenHash": {
+    "token": "cg_testtoken",
+    "expectedSha256Hex": "80bbc9fea56f2ab502fd145b54115d137db25af7d5396bd25fca4d509acac138"
+  },
+  "vaultRecord": {
+    "keyHex": "0303030303030303030303030303030303030303030303030303030303030303",
+    "ivHex": "040404040404040404040404",
+    "aad": "usr_a:key_b",
+    "plaintext": "sk-test-secret",
+    "expected": {
+      "v": 1,
+      "iv": "BAQEBAQEBAQEBAQE",
+      "tag": "s/Gwrc4lQV+prLI6nrhHPA==",
+      "ct": "M0w+ucjtczPqceMsFCA="
+    }
+  },
+  "secretFilePassphrase": {
+    "passphrase": "hunter2 hunter2",
+    "saltHex": "05050505050505050505050505050505",
+    "ivHex": "060606060606060606060606",
+    "plaintextMap": {
+      "profiles": "[]",
+      "token:c_1": "cg_abc"
+    },
+    "expected": {
+      "v": 1,
+      "kdf": "scrypt",
+      "N": 16384,
+      "r": 8,
+      "p": 1,
+      "salt": "BQUFBQUFBQUFBQUFBQUFBQ==",
+      "iv": "BgYGBgYGBgYGBgYG",
+      "tag": "MbSwIt/dwMPXgZjrchrl4g==",
+      "ct": "TXWhCOVw63ADffIe9D6Auj1ReuDiCrl5fDnyXxBnZx5oD3fFckg="
+    }
+  },
+  "secretFileKeyfile": {
+    "keyHex": "0707070707070707070707070707070707070707070707070707070707070707",
+    "ivHex": "080808080808080808080808",
+    "plaintextMap": {
+      "profiles": "[]",
+      "token:c_1": "cg_abc"
+    },
+    "expected": {
+      "v": 1,
+      "kdf": "keyfile",
+      "iv": "CAgICAgICAgICAgI",
+      "tag": "7DQ643HhyHf55L/08pbsOQ==",
+      "ct": "R2Iu7Jhdj5G7TVZH3i6VpJskM5PGoD+ggX5320fWP+PmLSjLvkk="
+    }
+  }
+}

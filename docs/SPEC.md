@@ -91,3 +91,83 @@ Per agent: what it has read/seen, in what order, links it made, its past judgmen
 - Which scores matter first for 3dcraft: print check only, or also a reference-image difference?
 - Do other Craft apps (logocraft, labelcraft, sitecraft) have an engine object like `E3`, or do they need one first?
 - Where does human rating get entered: the GUI, or the API only?
+
+## 8. craft-api gateway (identity broker + key vault + proxy)
+
+Code: `server/gateway/` (`npm run gateway`), tests: `test/gateway.test.mjs` (`npm run test:gateway`). Only `node:` built-ins, no new dependencies.
+
+**Env**: `CRAFT_MASTER_KEY` (required; 32 bytes base64 or hex; never committed, never stored), `CRAFT_GATEWAY_MODE` (`single` default | `multi`), `CRAFT_ALLOW_SIGNUP=1` (multi: open signup), `CRAFT_GATEWAY_PORT` (8787), `CRAFT_GATEWAY_HOST` (127.0.0.1), `CRAFT_GATEWAY_ID` (stable gateway id; generated and persisted if unset), `CRAFT_GATEWAY_NAME`, `CRAFT_JWT_KID`/`CRAFT_JWT_PREVIOUS_KIDS` and `CRAFT_AUDIT_PATH` (section 9.6), `CRAFT_CORS_ORIGINS` (comma list of exact browser origins; none by default), `CRAFT_UPSTREAM_ALLOW` (operator allow-list for private upstreams, see SSRF defences), `CRAFT_GATEWAY_DATA` (`data/gateway.json`, git-ignored, mode 0600).
+
+**Modes**: `single` = the first registered account becomes admin, then registration and `/users` are closed. `multi` = first account is admin; later users are created by an admin (`POST /users`) or by open signup if enabled. Every key/token is private to its owner.
+
+**Security**: passwords hashed with scrypt (N=16384, per-user salt), never stored plain; login throttled (5 failures -> 60 s). Vault: AES-256-GCM, random 12-byte IV per record, AAD = `ownerId:keyId`; keys derived from the master key via HKDF (separate vault and JWT keys). Secrets are decrypted in memory only while proxying; the API returns only a mask (`AIz…1234`). Session tokens are HS256 JWTs (1 h). API tokens (`cg_...`) are shown once, stored as SHA-256, revocable, optionally expiring, and limited to a subset of the creator's scopes. Scopes: `keys:read`, `keys:write`, `proxy:use`, `tokens:manage`, `data:read`, `data:write`, `admin`. Tokens carry grants per app (section 9.2).
+
+**Endpoints** (`/api/v1`, JSON, errors as in section 1):
+
+| Route | Auth/scope | Purpose |
+|---|---|---|
+| `GET /health`, `GET /providers` | none | status, provider list |
+| `POST /auth/register` `{userId,password}` | per mode | create account (password 10+ chars) |
+| `POST /auth/login` `{userId,password,scopes?}` | none | -> `{token,expiresIn,scopes}` |
+| `GET /auth/me` | any | user + scopes |
+| `GET/POST /users` | admin | list / create users (multi mode) |
+| `GET/POST /tokens`, `DELETE /tokens/:id` | tokens:manage | API tokens with grants (section 9.2) |
+| `POST /auth/logout`, `POST /auth/revoke-all` | any | revoke this session/token; revoke every session and token of the user |
+| `PUT /users/:id/roles` | admin | set a user's custom roles (`everyone` and `admin` are reserved) |
+| `GET /admin/audit` | admin | audit log entries (section 9.6) |
+| `GET/POST /resources`, `GET/DELETE /resources/:id`, `GET/PUT /resources/:id/content`, `GET/PUT /resources/:id/acl`, `GET /resources/:id/access`, `GET /admin/resources`, `GET /resource-types`, `GET /public/resources/:id/content` | see section 9.4 | server data with ACLs |
+| `GET/POST /keys`, `DELETE /keys/:id` | keys:read / keys:write | vault; POST `{provider,label,secret,baseUrl?,apps?}` (`apps` = app ids allowed to use the key, default the creating app, `['*']` = all) |
+| `ANY /proxy/:provider/*` | proxy:use | forwards upstream with the stored key attached |
+
+**Proxy**: providers are `ollama`, `gemini`, `openai`, `anthropic`, `custom`. The key is chosen by provider (first one, or label in header `X-Craft-Key`). Client `Authorization`/`x-api-key`/`x-goog-api-key`/cookie headers are dropped and the right upstream header is added server-side. `baseUrl` is only accepted for `ollama`/`custom`; path traversal is rejected; redirects are not followed; responses stream through.
+
+**SSRF defences** (upstream URLs are vetted when a key is created and again on every proxy request): `baseUrl` may only be set by admins in multi mode (any user in single mode, who is the admin). The host is resolved and every address is checked; loopback, RFC1918, CGNAT, link-local (incl. 169.254.169.254 metadata), ULA, multicast and unspecified ranges (IPv6 forms that embed an IPv4 address are first reduced to it for every check, including the allow-list and the self-port check: mapped `::ffff:a.b.c.d`/`::ffff:7f00:1`, compatible `::a.b.c.d`/`::7f00:1`, 6to4 `2002:wwxx:yyzz::`; Teredo `2001::/32` and NAT64 `64:ff9b::/96` are blocked outright) are refused with `400 bad_base_url` at create time and `403 upstream_blocked` at request time. Exceptions: `CRAFT_UPSTREAM_ALLOW` (comma list of `host`, `host:port`, `ip`, `ip:port`, IPv4 `a.b.c.d/len`, set by the operator) and, in single mode only, loopback (for local Ollama). The connection is pinned to the validated IP (custom `lookup`), so DNS rebinding cannot swap the target; only `http(s)` without embedded credentials is accepted. The gateway's own listen port on loopback/its bound address is always blocked, even if allow-listed.
+
+Not done: key rotation of the master key, per-key quotas/usage logs, TLS (run behind a reverse proxy; bind to localhost by default).
+
+## 9. Multiple gateways, app-scoped credentials, data ACLs, client protocol (v1)
+
+Code: `server/gateway/{app,data,resources}.mjs`, client `client/craftgw.mjs` (browser + Node ES module, no build), `client/node-store.mjs`, CLI `client/cli.mjs` (`npm run gw`). Tests: `test/gateway-access.test.mjs`, `test/client.test.mjs`. Vectors: `docs/test-vectors.json`.
+
+### 9.1 Gateway identity and connections
+Every gateway has an immutable `gatewayId` (`gw_...`, in `GET /health` and `GET /auth/me`). A **connection profile** is client-side only: `{ id, name, baseUrl, gatewayId, userId, app, tokenRef, expiresAt }`. It never contains a secret; the token is stored in the client's SecretStore under `tokenRef`. The client pins `gatewayId` when the connection is added and refuses to store or use a token if `/auth/login` or `/auth/me` reports a different id. One user can hold any number of profiles (several gateways, or several apps on one gateway), each with its own grants; `Connections.status()` / `craftgw status` print user, app and scopes per gateway. `baseUrl` must be `https` (plain `http` only for localhost). A cross-gateway credential is one grant spec minted once per gateway (`mintAcross`): every gateway stores only its own token hash, and a token whose `gateways` list does not contain the serving gateway (or `*`) is rejected.
+
+### 9.2 Key scoping model
+A credential (session JWT or API token `cg_...`) carries `userId`, `gatewayId` (JWT claim `gw`; API tokens: `gateways` list) and **grants**: `[{ app: '*' | appId, scopes: [...] }]`. App ids match `^[a-z0-9][a-z0-9_-]{1,31}$` (e.g. `3dcraft`, `ataricraft`, `imagecraft`).
+- (a) user-wide: one grant `{app:'*'}`: all apps on this gateway.
+- (b) app-specific: one grant `{app:'ataricraft'}`: usable only for that app.
+- (c) both / per-app permission lists: several grants, e.g. `imagecraft: [data:read]`, `3dcraft: [data:read, data:write]`, optionally plus `*`.
+Create: `POST /tokens {name, expiresInDays?, gateways?, grants:[...]}` or shorthand `{name, app?, scopes}`; login accepts the same `app`/`scopes`/`grants`. A token can only grant a subset of the creator's own scopes; an app-bound credential can only mint for its own app; `admin` is only valid with app `*`.
+**Binding on every request**: the client sends `X-Craft-App: <appId>`. The gateway picks the exact-app grant, else the `*` grant; if none: `403 app_not_permitted`, or `403 app_required` when the header is missing on an app-bound credential. The matched grant's scopes are the request's scopes. Resources and vault keys are filtered by the bound app (9.4). For `*` credentials the header is advisory and never used for ACL matching.
+**Revocation/expiry**: API tokens are stored as SHA-256 and checked on every request (`DELETE /tokens/:id`, optional `expiresAt`). Sessions (1 h) carry `jti`; `POST /auth/logout` revokes one, `POST /auth/revoke-all` sets `validAfter` on the user (all older sessions die) and revokes all their API tokens.
+
+### 9.3 Wire protocol (for Rust / WASM / any client)
+Base: `{baseUrl}/api/v1`, JSON UTF-8, always TLS except localhost. Success `{ok:true,...}`; error `{ok:false,error:{code,message}}` with HTTP status. Headers: `Authorization: Bearer <token>`, `X-Craft-App: <appId>` (see 9.2), `Content-Type: application/json`. Flow:
+1. `GET /health` -> `{ok,mode,gatewayId,name,protocol:1}`; pin `gatewayId`.
+2. `POST /auth/login {userId,password,app?,scopes?,grants?}` -> `{token,tokenType:'Bearer',expiresIn,gatewayId,grants}`. The password travels only in this call, over TLS; the server hashes with scrypt. Clients must not persist it. Throttled after 5 failures (429).
+3. `GET /auth/me` -> `{gatewayId,gatewayName,user,app,scopes,grants,expiresAt}`; verify `gatewayId` equals the pinned id.
+4. Tokens are opaque to clients. (JWT layout, for reference: HS256, header `{"alg":"HS256","typ":"JWT"}`, claims `sub,gw,grants,jti,iatMs,iat,exp`.)
+5. `POST /auth/logout` when signing out.
+Secure client storage (9.5). Rust clients: `reqwest`+`rustls`, `aes-gcm`, `scrypt`, `keyring`/`security-framework`/DPAPI; WASM: `fetch` + WebCrypto + IndexedDB exactly like `BrowserSecretStore`.
+
+### 9.4 Server data, ACLs, deny-by-default
+Resource: `{ id, type, name, app|null, owner, acl[], size, contentType, data }` with `type` in the registry from `GET /resource-types` (`dataset, asset, clipart, font, diskimage, other`; up to 2 MiB each, inline; large blobs deferred). ACL entry: `{ principal:{kind:'user'|'role'|'app'|'public', id}, perms:['read'|'write'|'admin'], app?: appId }` (`write` implies `read`, `admin` implies both). Evaluation (`resources.mjs`):
+1. An app-bound credential only ever sees resources whose `app` equals its app; otherwise 404.
+2. Permissions = owner (all) + every matching ACL entry. `user` matches the user; `role` matches users holding it (custom roles set via `PUT /users/:id/roles`; role `everyone` matches every *authenticated* user and only because an admin wrote that entry; `everyone`/`admin` cannot be assigned to users); `app` matches only credentials bound to that app; `public` matches anyone, unauthenticated (read-only, via `GET /public/resources/:id/content` only). An entry's `app` field restricts it to requests under that app-bound credential.
+3. No entry and not owner: no access (404, existence is not revealed). Admin role: may list (`GET /admin/resources`), query, edit ACLs and delete, but gets **no content access** unless an ACL grants it. `everyone`/`public` entries can only be written (or removed) by an admin and never carry `admin`; `public` is read-only.
+4. Every route also requires the scope (`data:read` for read/list, `data:write` for create/update/ACL/delete).
+**Who can access this?** `GET /resources/:id/access` (managers only: owner, `admin` permission, admin role with admin scope) returns the owner, every ACL entry and the resolved users/roles/apps, plus what the admin role can and cannot do. Default for everything is deny; there is no implicit public or `everyone` access, and unauthenticated requests succeed only on `/health`, `/providers`, `/auth/login|register` (per mode) and public resources. CORS is also deny-by-default (`CRAFT_CORS_ORIGINS`).
+
+### 9.5 Client secret storage and test vectors
+- Browser: AES-256-GCM with a non-extractable `CryptoKey` kept in IndexedDB (`craftgw` / `kv`: `__wrapkey`, `v:<name>` = `{iv, ct}`; AAD = the entry name). The page can use but never read the key.
+- Node: OS keychain when present (Linux `secret-tool`, macOS `security -i`; secrets via stdin, not argv), otherwise an encrypted file `~/.config/craftgw/secrets.json` (0600, directory 0700). File format: `{v:1, kdf:'scrypt'|'keyfile', [N,r,p,salt], iv, tag, ct}` (base64); key = `scrypt(passphrase, salt, 32)` (N=16384,r=8,p=1) when `CRAFTGW_PASSPHRASE` is set, else a random 32-byte key in `secrets.json.key` (0600; weaker, same-user protection only); AES-256-GCM, AAD = ASCII `craftgw-secrets-v1`; plaintext = JSON map name->string. Windows keychain (DPAPI) is not implemented; it uses the encrypted file.
+- `docs/test-vectors.json` (checked in `test/client.test.mjs`; scrypt/HMAC/SHA-256 also cross-checked with an independent implementation): `passwordHash` (server record `scrypt$N$r$p$saltB64$hashB64`), `jwt` (HS256 with fixed key/time), `apiTokenHash` (SHA-256 hex), `vaultRecord` (AES-256-GCM server vault record), `secretFilePassphrase` and `secretFileKeyfile` (client file format).
+
+### 9.6 Audit log and JWT key rotation
+**Audit log** (`server/gateway/audit.mjs`): append-only JSON lines at `CRAFT_AUDIT_PATH` (default `<data file>.audit.jsonl`, 0600; in-memory when the store has no file). Each entry is `{seq, ts, event, actor, app, ip, ..., prev, hash}` with `hash = sha256(prev || entryJson)`, so editing or deleting a line breaks the chain (`verifyChain`); the chain continues across restarts. Events: `login.success`, `login.failure`, `user.create`, `logout`, `token.create`, `token.revoke`, `token.revoke_all`, `key.create`, `key.delete`, `key.use` (provider, label, upstream host; never the key), `acl.change` (before/after), `access.denied` (401/403/429 and resource 404-as-denied, with route/status/code). Never logged: passwords, tokens, API keys, secrets, Authorization headers, free-text user ids (a non-matching id is logged as `[invalid]`); the writer also rejects secret-looking field names. Read with `GET /admin/audit?limit=&event=` (admin only). The file is not rotated/pruned by the gateway and unauthenticated 401s are logged, so apply logrotate/size limits (the chain can be restarted from a new file).
+**JWT key rotation**: session JWT headers carry `kid`. Keys are derived from the master key per kid (`v1` = the original derivation, so existing tokens stay valid; others use HKDF info `craftapi-jwt-v1:<kid>`). Set `CRAFT_JWT_KID=k2` and `CRAFT_JWT_PREVIOUS_KIDS=v1`: new sessions are signed with `k2`, tokens signed with `v1` are accepted until they expire (sessions last 1 h); drop `v1` from the list afterwards to retire it. Unknown kids, forged kids and `alg` other than HS256 are rejected. Rotating the master key itself is still not supported (it also encrypts the vault).
+
+### 9.7 Done / deferred
+Done: items above, audit log, JWT key rotation; tests for deny-by-default, app binding, cross-user isolation, revocation, gateway binding, CORS, storage, audit, rotation. Deferred: federated single-token-for-many-gateways (today one token per gateway), group objects (roles are plain names on users), MFA, Windows DPAPI store, large-blob storage and streaming uploads, password change/reset, master-key rotation, per-resource quotas, a GUI.
+
+**Tests**: `npm test` runs the Node tests (`test/`) and then `server/run-browser-tests.mjs`, which skips the 3dcraft browser smoke tests with a `SKIPPED` message when Chrome/Edge or 3dcraft is missing (`CRAFT_REQUIRE_BROWSER=1` makes the skip a failure).

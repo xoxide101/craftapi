@@ -7,7 +7,10 @@
   "scripts": {
     "smoke": "node server/smoke.mjs",
     "smoke:mcp": "node server/mcp-smoke.mjs",
-    "test": "node server/smoke.mjs && node server/mcp-smoke.mjs",
+    "test:gateway": "node --test test/",
+    "gateway": "node server/gateway/index.mjs",
+    "gw": "node client/cli.mjs",
+    "test": "node --test test/ && node server/run-browser-tests.mjs",
     "mcp": "node server/mcp.mjs"
   },
   "dependencies": {
