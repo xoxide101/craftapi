@@ -6,6 +6,7 @@ import * as C from './crypto.mjs';
 import { vetUpstream, parseAllowList } from './ssrf.mjs';
 import { createDataRoutes, publicRead } from './data.mjs';
 import { APP_RE } from './resources.mjs';
+import { AuditLog } from './audit.mjs';
 
 const USER_SCOPES = ['keys:read', 'keys:write', 'proxy:use', 'tokens:manage', 'data:read', 'data:write'];
 const ALL_SCOPES = [...USER_SCOPES, 'admin'];
@@ -18,9 +19,16 @@ class HttpError extends Error {
 const isIPLiteral = (h) => /^[\d.]+$|:/.test(h);
 const err = (s, c, m) => new HttpError(s, c, m);
 
-export function createGateway({ masterKey, mode = 'single', allowSignup = false, store = new Store(), upstreamAllow = '', allowLoopback = mode === 'single', gatewayId, name = 'craft-api gateway', corsOrigins = '' } = {}) {
+export function createGateway({ masterKey, mode = 'single', allowSignup = false, store = new Store(), upstreamAllow = '', allowLoopback = mode === 'single', gatewayId, name = 'craft-api gateway', corsOrigins = '', jwtKid, jwtPreviousKids = [], auditPath } = {}) {
   if (!['single', 'multi'].includes(mode)) throw new Error('mode must be single or multi');
-  const keys = C.deriveKeys(C.parseMasterKey(masterKey));
+  const keys = C.deriveKeys(C.parseMasterKey(masterKey), { kid: jwtKid || C.DEFAULT_KID, previousKids: jwtPreviousKids });
+  const auditLog = new AuditLog(auditPath ?? (store.path ? `${store.path}.audit.jsonl` : null));
+  const clientIp = (req) => req?.socket?.remoteAddress ?? null;
+  // Never pass secrets, passwords or tokens here (AuditLog also rejects secret-looking field names).
+  const audit = (event, req, fields = {}) => {
+    const c = req?.craftCtx;
+    auditLog.record(event, { actor: c ? c.user.userId : null, app: c ? c.app : null, ip: clientIp(req), ...fields });
+  };
   const db = store.data;
   db.meta ??= {}; db.resources ??= {}; db.revoked ??= {};
   db.meta.gatewayId = gatewayId || db.meta.gatewayId || C.newId('gw');
@@ -81,7 +89,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
 
   function issueSession(u, grants) {
     const jti = C.newId('ses');
-    const token = C.signJwt(keys.jwt, { sub: u.id, gw: gwId, grants, jti, iatMs: Date.now() }, SESSION_TTL);
+    const token = C.signJwt(keys.jwt, { sub: u.id, gw: gwId, grants, jti, iatMs: Date.now() }, SESSION_TTL, undefined, keys.jwtKid);
     return { token, tokenType: 'Bearer', expiresIn: SESSION_TTL, gatewayId: gwId, grants };
   }
 
@@ -96,7 +104,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
       if (!t.gateways.includes('*') && !t.gateways.includes(gwId)) throw err(401, 'unauthorized', 'token is not valid for this gateway');
       sub = t.userRef; grants = t.grants; tokenId = t.id; exp = t.expiresAt;
     } else {
-      const claims = C.verifyJwt(keys.jwt, m[1]);
+      const claims = C.verifyJwt((k) => keys.jwtRing.get(k), m[1]);
       if (!claims || claims.gw !== gwId) throw err(401, 'unauthorized', 'invalid or expired token');
       if (db.revoked[claims.jti]) throw err(401, 'unauthorized', 'token revoked');
       sub = claims.sub; grants = claims.grants; jti = claims.jti; exp = claims.exp;
@@ -113,7 +121,9 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
       if (!hdr) throw err(403, 'app_required', 'this credential is app-bound; send X-Craft-App');
       throw err(403, 'app_not_permitted', `credential is not permitted for app ${hdr}`);
     }
-    return { user, scopes: g.scopes, app: g.app, grants, tokenId, jti, exp };
+    const ctx = { user, scopes: g.scopes, app: g.app, grants, tokenId, jti, exp, req };
+    req.craftCtx = ctx;
+    return ctx;
   }
   const need = (ctx, scope) => { if (!ctx.scopes.includes(scope)) throw err(403, 'forbidden', `missing scope ${scope}`); };
 
@@ -132,7 +142,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
     res.writeHead(status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
     res.end(JSON.stringify(obj));
   };
-  const data = createDataRoutes({ db, store, err, readJson, readBody, send, need });
+  const data = createDataRoutes({ db, store, err, readJson, readBody, send, need, audit });
   const keyUsable = (k, ctx) => ctx.app === '*' || (k.apps || ['*']).includes(ctx.app);
 
   function throttle(id) {
@@ -164,6 +174,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
     let vetted;
     try { vetted = await vet(target.href); } catch (e) { throw err(403, 'upstream_blocked', e.message); }
 
+    audit('key.use', req, { keyId: rec.id, provider, label: rec.label, upstream: target.host, method: req.method });
     let secret = '';
     if (rec.secret) secret = C.decrypt(keys.vault, rec.secret, `${rec.owner}:${rec.id}`);
     const headers = {};
@@ -217,6 +228,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
         else if (!allowSignup) throw err(403, 'signup_closed', 'signup disabled; an admin must create users');
       }
       const u = await createUser(userId, password, role);
+      audit('user.create', req, { target: u.userId, role: u.role, via: 'register' });
       return send(res, 201, { ok: true, user: publicUser(u) });
     }
 
@@ -228,10 +240,13 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
       const u = typeof userId === 'string' && typeof password === 'string' ? findUser(userId) : null;
       // Verify against a dummy hash for unknown users to keep timing similar.
       const ok = await C.verifyPassword(password ?? '', u ? u.passwordHash : dummyHash());
-      if (!u || !ok) { noteFailure(tid); throw err(401, 'invalid_credentials', 'invalid userId or password'); }
+      const safeId = typeof userId === 'string' && /^[a-zA-Z0-9._-]{3,64}$/.test(userId) ? userId.toLowerCase() : '[invalid]'; // never log free text: users sometimes paste passwords here
+      if (!u || !ok) { noteFailure(tid); audit('login.failure', req, { target: safeId }); throw err(401, 'invalid_credentials', 'invalid userId or password'); }
       failures.delete(tid);
       const grants = grantsFromBody(body, scopesFor(u), '*', scopesFor(u));
-      return send(res, 200, { ok: true, ...issueSession(u, grants) });
+      const sess = issueSession(u, grants);
+      audit('login.success', req, { target: u.userId, grants: grants.map((g) => ({ app: g.app, scopes: g.scopes })) });
+      return send(res, 200, { ok: true, ...sess });
     }
 
     const ctx = authenticate(req);
@@ -245,13 +260,23 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
         for (const [j, e] of Object.entries(db.revoked)) if (e < Date.now() / 1000) delete db.revoked[j];
       } else if (ctx.tokenId) db.tokens[ctx.tokenId].revoked = true;
       store.save();
+      audit('logout', req, { credential: ctx.jti ? 'session' : 'apitoken', credId: ctx.tokenId });
       return send(res, 200, { ok: true });
     }
     if (m === 'POST' && path === '/api/v1/auth/revoke-all') {
       ctx.user.validAfter = Date.now();
       for (const t of Object.values(db.tokens)) if (t.userRef === ctx.user.id) t.revoked = true;
       store.save();
+      audit('token.revoke_all', req);
       return send(res, 200, { ok: true });
+    }
+    if (m === 'GET' && path === '/api/v1/admin/audit') {
+      need(ctx, 'admin');
+      if (ctx.user.role !== 'admin') throw err(403, 'forbidden', 'admin only');
+      const ev = url.searchParams.get('event');
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 1000);
+      const all = auditLog.entries();
+      return send(res, 200, { ok: true, total: all.length, entries: all.filter((e) => !ev || e.event === ev).slice(-limit) });
     }
 
     if (await data(req, res, ctx, path, url)) return;
@@ -274,6 +299,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
         if (mode === 'single') throw err(403, 'single_user_mode', 'cannot add users in single-user mode');
         const { userId, password, role } = await readJson(req);
         const u = await createUser(userId, password, role === 'admin' ? 'admin' : 'user');
+        audit('user.create', req, { target: u.userId, role: u.role, via: 'admin' });
         return send(res, 201, { ok: true, user: publicUser(u) });
       }
     }
@@ -294,6 +320,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
           expiresAt: Number.isFinite(expiresInDays) && expiresInDays > 0 ? new Date(Date.now() + expiresInDays * 864e5).toISOString() : null,
         };
         db.tokens[t.id] = t; store.save();
+        audit('token.create', req, { credId: t.id, name: t.name, grants: t.grants, gateways: t.gateways, expiresAt: t.expiresAt });
         return send(res, 201, { ok: true, token: raw, info: publicToken(t) }); // raw token shown once
       }
     }
@@ -303,6 +330,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
       const t = db.tokens[r[1]];
       if (!t || t.userRef !== ctx.user.id) throw err(404, 'not_found', 'token not found');
       t.revoked = true; store.save();
+      audit('token.revoke', req, { credId: t.id });
       return send(res, 200, { ok: true });
     }
 
@@ -335,6 +363,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
           masked: C.maskSecret(secret), secret: secret ? C.encrypt(keys.vault, secret, `${ctx.user.id}:${id}`) : null,
         };
         store.save();
+        audit('key.create', req, { keyId: id, provider, label, apps: db.keys[id].apps });
         return send(res, 201, { ok: true, key: publicKey(db.keys[id]) });
       }
     }
@@ -344,6 +373,7 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
       const k = db.keys[r[1]];
       if (!k || k.owner !== ctx.user.id || !keyUsable(k, ctx)) throw err(404, 'not_found', 'key not found');
       delete db.keys[k.id]; store.save();
+      audit('key.delete', req, { keyId: k.id, provider: k.provider });
       return send(res, 200, { ok: true });
     }
 
@@ -367,11 +397,14 @@ export function createGateway({ masterKey, mode = 'single', allowSignup = false,
     if (req.method === 'OPTIONS') { res.writeHead(origin && cors.has(origin) ? 204 : 403); return res.end(); }
     route(req, res).catch((e) => {
       if (!(e instanceof HttpError)) console.error('gateway error:', e.message);
+      else if ([401, 403, 429].includes(e.status) && e.code !== 'invalid_credentials') {
+        try { audit('access.denied', req, { method: req.method, path: req.url.split('?')[0], status: e.status, code: e.code }); } catch (x) { console.error('audit failed:', x.message); }
+      }
       if (res.headersSent) return res.destroy();
       const h = e instanceof HttpError ? e : err(500, 'internal', 'internal error');
       send(res, h.status, { ok: false, error: { code: h.code, message: h.message } });
     });
   });
   gateway = server;
-  return { server, store };
+  return { server, store, audit: auditLog };
 }

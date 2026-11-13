@@ -2,7 +2,7 @@ import * as C from './crypto.mjs';
 import { RESOURCE_TYPES, KNOWN_APPS, APP_RE, ROLE_RE, PERMS, MAX_RESOURCE_BYTES, evaluate, entryMatches, publicResource } from './resources.mjs';
 
 // Data/ACL routes. Returns true when the request was handled.
-export function createDataRoutes({ db, store, err, readJson, readBody, send, need }) {
+export function createDataRoutes({ db, store, err, readJson, readBody, send, need, audit }) {
   const usersById = () => db.users;
   const isAdmin = (ctx) => ctx.user.role === 'admin' && ctx.scopes.includes('admin');
 
@@ -10,7 +10,7 @@ export function createDataRoutes({ db, store, err, readJson, readBody, send, nee
     const r = db.resources[id];
     const ev = r && evaluate(r, ctx.user, ctx);
     const canSee = ev && (ev.perms.size || ev.manage);
-    if (!r || !canSee) throw err(404, 'not_found', 'resource not found'); // never reveal existence without access
+    if (!r || !canSee) { audit('access.denied', ctx.req, { resource: id, wanted: needPerm, status: 404, code: 'not_found' }); throw err(404, 'not_found', 'resource not found'); } // never reveal existence without access
     if (needPerm === 'manage' ? !ev.manage : !ev.perms.has(needPerm)) throw err(403, 'forbidden', `requires ${needPerm} access`);
     return { r, ev };
   }
@@ -120,6 +120,7 @@ export function createDataRoutes({ db, store, err, readJson, readBody, send, nee
           const priv = (e) => e.principal.kind === 'public' || (e.principal.kind === 'role' && e.principal.id === 'everyone');
           if (JSON.stringify(res0.acl.filter(priv)) !== JSON.stringify(acl.filter(priv))) throw err(403, 'forbidden', 'only an admin may change everyone/public entries');
         }
+        audit('acl.change', req, { resource: res0.id, before: res0.acl, after: acl });
         res0.acl = acl; res0.updatedAt = new Date().toISOString(); store.save();
         return send(res, 200, { ok: true, acl }), true;
       }

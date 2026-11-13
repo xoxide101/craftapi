@@ -211,3 +211,45 @@ test('ssrf: proxy re-vets at request time and never reaches blocked hosts', asyn
   assert.equal(hits, 0);
   t.close(); up.close(); up.closeAllConnections();
 });
+
+test('ssrf: hex-mapped, IPv4-compatible and 6to4 forms are reduced to the embedded IPv4', async () => {
+  const blocked = [
+    '::ffff:7f00:1', '::ffff:7F00:0001', '0:0:0:0:0:ffff:7f00:1', '::ffff:a9fe:a9fe', '::ffff:a00:1', '::ffff:c0a8:101', '::ffff:ac10:1',
+    '::7f00:1', '::127.0.0.1', '::a9fe:a9fe', '::a00:1', '::c0a8:1',
+    '2002:7f00:1::', '2002:7f00:1::1', '2002:a9fe:a9fe::', '2002:a00:1::', '2002:c0a8:101::', '2002:ac10:1::',
+  ];
+  for (const ip of blocked) assert.ok(isBlockedIp(ip), `${ip} should be blocked`);
+  for (const ip of ['::ffff:808:808', '2002:808:808::', '::808:808', '2606:4700::1111']) assert.ok(!isBlockedIp(ip), `${ip} should be allowed`);
+  for (const ip of blocked) await assert.rejects(vetUpstream(`http://[${ip}]:8080/`), `${ip} via vetUpstream`);
+  await vetUpstream('http://[::ffff:808:808]:8080/');
+  // allow-list entries match the embedded IPv4, and loopback allowance applies to the embedded form too
+  await vetUpstream('http://[::ffff:a00:5]:8080/', { allowList: parseAllowList('10.0.0.5:8080') });
+  await assert.rejects(vetUpstream('http://[::ffff:a00:6]:8080/', { allowList: parseAllowList('10.0.0.5:8080') }));
+  await vetUpstream('http://[::ffff:7f00:1]:9/', { allowLoopback: true });
+  await assert.rejects(vetUpstream('http://[::ffff:7f00:1]:9/'));
+});
+
+test('ssrf: self-port check catches every loopback encoding, even when allow-listed', async () => {
+  const self = 4321;
+  for (const h of ['[::ffff:7f00:1]', '[::7f00:1]', '[2002:7f00:1::]', '[::ffff:127.0.0.1]', '127.0.0.1', '[::1]']) {
+    await assert.rejects(vetUpstream(`http://${h}:${self}/`, { allowLoopback: true, self: { port: self, host: '127.0.0.1' } }), /gateway itself/, h);
+    await assert.rejects(vetUpstream(`http://${h}:${self}/`, { allowList: parseAllowList('127.0.0.0/8, ::1'), self: { port: self, host: '127.0.0.1' } }), /gateway itself/, h);
+  }
+  const t = await boot({ mode: 'multi', upstreamAllow: '127.0.0.0/8' });
+  await t.call('POST', '/auth/register', { body: { userId: 'admin1', password: PW } });
+  const a = (await t.call('POST', '/auth/login', { body: { userId: 'admin1', password: PW } })).json.token;
+  const port = t.gw.server.address().port;
+  let n = 0;
+  for (const h of ['[::ffff:7f00:1]', '[::7f00:1]', '[2002:7f00:1::]']) {
+    const r = await t.call('POST', '/keys', { token: a, body: { provider: 'ollama', label: `s${n++}`, baseUrl: `http://${h}:${port}` } });
+    assert.equal(r.status, 400, h);
+    assert.match(r.json.error.message, /gateway itself|allow-list|private/);
+  }
+  // and the request-time re-check, with a poisoned stored record
+  const k = (await t.call('POST', '/keys', { token: a, body: { provider: 'ollama', label: 'ok' } })).json.key;
+  t.store.data.keys[k.id].baseUrl = `http://[::ffff:7f00:1]:${port}`;
+  const r = await t.call('GET', '/proxy/ollama/api/tags', { token: a });
+  assert.equal(r.status, 403);
+  assert.equal(r.json.error.code, 'upstream_blocked');
+  t.close();
+});

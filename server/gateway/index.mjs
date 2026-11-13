@@ -11,6 +11,9 @@ const { server } = createGateway({
   gatewayId: process.env.CRAFT_GATEWAY_ID || undefined,
   name: process.env.CRAFT_GATEWAY_NAME || undefined,
   corsOrigins: process.env.CRAFT_CORS_ORIGINS || '',
+  jwtKid: process.env.CRAFT_JWT_KID || undefined,
+  jwtPreviousKids: (process.env.CRAFT_JWT_PREVIOUS_KIDS || '').split(',').map((x) => x.trim()).filter(Boolean),
+  auditPath: process.env.CRAFT_AUDIT_PATH || undefined,
   upstreamAllow: process.env.CRAFT_UPSTREAM_ALLOW || '',
   store: new Store(process.env.CRAFT_GATEWAY_DATA || 'data/gateway.json'),
 });

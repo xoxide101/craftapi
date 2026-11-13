@@ -25,9 +25,13 @@ export function parseMasterKey(value) {
   return buf;
 }
 
-export function deriveKeys(master) {
+export const DEFAULT_KID = 'v1';
+export function deriveKeys(master, { kid = DEFAULT_KID, previousKids = [] } = {}) {
   const d = (info) => Buffer.from(hkdfSync('sha256', master, Buffer.alloc(0), info, 32));
-  return { vault: d('craftapi-vault-v1'), jwt: d('craftapi-jwt-v1') };
+  // 'v1' keeps the original derivation so existing tokens stay valid; other kids get their own key.
+  const jwtFor = (k) => d(k === DEFAULT_KID ? 'craftapi-jwt-v1' : `craftapi-jwt-v1:${k}`);
+  const ring = new Map([kid, ...previousKids].map((k) => [k, jwtFor(k)]));
+  return { vault: d('craftapi-vault-v1'), jwt: ring.get(kid), jwtKid: kid, jwtRing: ring };
 }
 
 // AES-256-GCM; aad binds a record to its owner so blobs can't be swapped between users.
@@ -52,23 +56,26 @@ export function maskSecret(s) {
 
 const b64u = (b) => Buffer.from(b).toString('base64url');
 
-export function signJwt(secret, claims, ttlSec, now = Math.floor(Date.now() / 1000)) {
-  const head = b64u(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+export function signJwt(secret, claims, ttlSec, now = Math.floor(Date.now() / 1000), kid) {
+  const head = b64u(JSON.stringify(kid ? { alg: 'HS256', typ: 'JWT', kid } : { alg: 'HS256', typ: 'JWT' }));
   const body = b64u(JSON.stringify({ ...claims, iat: now, exp: now + ttlSec }));
   const sig = createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
   return `${head}.${body}.${sig}`;
 }
 
+// secret: a Buffer, or a function (kid) => Buffer|undefined for key rotation. Tokens without kid use DEFAULT_KID.
 export function verifyJwt(secret, token) {
   const parts = String(token).split('.');
   if (parts.length !== 3) return null;
-  const expected = createHmac('sha256', secret).update(`${parts[0]}.${parts[1]}`).digest();
-  const given = Buffer.from(parts[2], 'base64url');
-  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
   try {
     const head = JSON.parse(Buffer.from(parts[0], 'base64url'));
+    const key = typeof secret === 'function' ? secret(head.kid ?? DEFAULT_KID) : secret;
+    if (!key || head.alg !== 'HS256') return null;
+    const expected = createHmac('sha256', key).update(`${parts[0]}.${parts[1]}`).digest();
+    const given = Buffer.from(parts[2], 'base64url');
+    if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
     const claims = JSON.parse(Buffer.from(parts[1], 'base64url'));
-    if (head.alg !== 'HS256' || typeof claims.exp !== 'number' || claims.exp < Date.now() / 1000) return null;
+    if (typeof claims.exp !== 'number' || claims.exp < Date.now() / 1000) return null;
     return claims;
   } catch { return null; }
 }

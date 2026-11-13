@@ -21,7 +21,7 @@ Started Wed 2026-10-21 for review with Claude on Friday. First target: **3dcraft
 
 ```
 npm install
-npm test            # API + explorer, then the MCP server through a real MCP client
+npm test            # gateway/client tests, then the browser smoke tests (skipped with a message if no Chrome/3dcraft)
 npm run mcp         # start the MCP server (stdio)
 ```
 

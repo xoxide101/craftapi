@@ -13,6 +13,13 @@ const BROWSERS = [
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
 ].filter(Boolean);
 
+/** Returns { ok:true } or { ok:false, reason } so callers can skip browser tests cleanly. */
+export function browserPrereqs(app = DEFAULT_APP) {
+  if (!BROWSERS.find(existsSync)) return { ok: false, reason: 'no Chrome/Edge found (set CHROME_PATH)' };
+  if (!existsSync(path.resolve(app))) return { ok: false, reason: `3dcraft not found at ${path.resolve(app)} (set CRAFT3D_INDEX)` };
+  return { ok: true };
+}
+
 export async function openSession({ app = DEFAULT_APP, headless = true } = {}) {
   const exe = BROWSERS.find(existsSync);
   if (!exe) throw new Error('No Chrome or Edge found; set CHROME_PATH');
