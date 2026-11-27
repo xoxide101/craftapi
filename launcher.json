@@ -1,0 +1,9 @@
+{
+ "name": "CraftAPI",
+ "icon": "🔌",
+ "about": "The Craft command layer for people and AI (library, no page)",
+ "group": "Data, AI and building",
+ "order": 30,
+ "entry": "",
+ "status": "lab"
+}
